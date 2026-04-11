@@ -6,7 +6,10 @@
 #include <iostream>
 #include <limits>
 #include <random>
+#include <sstream>
+#include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 using i32 = int32_t;
@@ -17,6 +20,11 @@ using u32 = uint32_t;
 // -------------------------------
 static constexpr int   MAX_U_FOR_COUNTING = 5'000'000; // bins max (payload counts ~ 20MB)
 static constexpr int   U_TO_N_RATIO       = 8;         // counting si U <= 8*n
+
+// Paralelización counting
+static constexpr size_t MIN_ITEMS_FOR_PARALLEL_COUNTING = 100'000;
+static constexpr size_t MIN_ITEMS_PER_THREAD            = 25'000;
+static constexpr uint64_t MAX_PARALLEL_COUNTING_BYTES   = 256ULL * 1024ULL * 1024ULL;
 
 // Benchmark config
 static constexpr int WARM = 3;
@@ -33,7 +41,7 @@ struct Meta {
 };
 
 static inline bool is_sorted_nondec(const std::vector<i32>& a) {
-    for (size_t i = 1; i < a.size(); i++) if (a[i-1] > a[i]) return false;
+    for (size_t i = 1; i < a.size(); i++) if (a[i - 1] > a[i]) return false;
     return true;
 }
 
@@ -44,12 +52,58 @@ static std::string fmt_bytes(uint64_t b) {
     oss << std::fixed << std::setprecision(1);
     if (b < 1024) return std::to_string(b) + " B";
     double kb = b / 1024.0;
-    if (kb < 1024) { oss << kb << " KB"; return oss.str(); }
+    if (kb < 1024) {
+        oss << kb << " KB";
+        return oss.str();
+    }
     double mb = kb / 1024.0;
-    if (mb < 1024) { oss << std::setprecision(2) << mb << " MB"; return oss.str(); }
+    if (mb < 1024) {
+        oss << std::setprecision(2) << mb << " MB";
+        return oss.str();
+    }
     double gb = mb / 1024.0;
     oss << std::setprecision(2) << gb << " GB";
     return oss.str();
+}
+
+struct RangeInfo {
+    i32 minv;
+    i32 maxv;
+    uint64_t U;
+};
+
+static RangeInfo range_of(const std::vector<i32>& a) {
+    i32 minv = a[0], maxv = a[0];
+    for (i32 v : a) {
+        if (v < minv) minv = v;
+        if (v > maxv) maxv = v;
+    }
+    uint64_t U = (uint64_t)((int64_t)maxv - (int64_t)minv + 1LL);
+    return {minv, maxv, U};
+}
+
+static bool counting_ok(uint64_t U, size_t n) {
+    return U > 0 &&
+           U <= (uint64_t)std::numeric_limits<int>::max() &&
+           U <= (uint64_t)MAX_U_FOR_COUNTING &&
+           U <= (uint64_t)U_TO_N_RATIO * (uint64_t)n;
+}
+
+static size_t choose_parallel_counting_threads(size_t n, size_t u) {
+    if (n < MIN_ITEMS_FOR_PARALLEL_COUNTING) return 1;
+
+    const unsigned hw = std::thread::hardware_concurrency();
+    size_t threads = hw == 0 ? 2 : (size_t)hw;
+    threads = std::max<size_t>(1, threads);
+
+    const size_t byWork = std::max<size_t>(1, n / MIN_ITEMS_PER_THREAD);
+    threads = std::min(threads, byWork);
+    if (threads < 2) return 1;
+
+    while (threads > 1 && (uint64_t)threads * bytes_int_array((uint64_t)u) > MAX_PARALLEL_COUNTING_BYTES) {
+        --threads;
+    }
+    return std::max<size_t>(1, threads);
 }
 
 // ------------------------------------
@@ -67,27 +121,17 @@ struct DialSorter {
         if (counts.size() < u) counts.resize(u);
     }
 
-    Meta sort_in_place(std::vector<i32>& a) {
-        if (a.size() <= 1) {
-            return {Mode::COUNTING, 0, 0, 1, 0};
-        }
+    uint64_t counting_extra_bytes(size_t u, size_t n) const {
+        const size_t threads = choose_parallel_counting_threads(n, u);
+        return bytes_int_array((uint64_t)u) * (uint64_t)threads;
+    }
 
-        i32 minv = a[0], maxv = a[0];
-        for (i32 v : a) {
-            if (v < minv) minv = v;
-            if (v > maxv) maxv = v;
-        }
+    Meta counting_sort_in_place(std::vector<i32>& a, i32 minv, i32 maxv, uint64_t U) {
+        const size_t u = (size_t)U;
+        const size_t n = a.size();
+        const size_t threads = choose_parallel_counting_threads(n, u);
 
-        uint64_t U = (uint64_t)((int64_t)maxv - (int64_t)minv + 1LL);
-
-        bool countingOk =
-            U > 0 &&
-            U <= (uint64_t)std::numeric_limits<int>::max() &&
-            U <= (uint64_t)MAX_U_FOR_COUNTING &&
-            U <= (uint64_t)U_TO_N_RATIO * (uint64_t)a.size();
-
-        if (countingOk) {
-            size_t u = (size_t)U;
+        if (threads <= 1) {
             ensure_counts(u);
             std::fill(counts.begin(), counts.begin() + u, 0);
 
@@ -102,13 +146,67 @@ struct DialSorter {
             if (k != a.size()) throw std::runtime_error("Counting did not fill output.");
 
             return {Mode::COUNTING, minv, maxv, U, bytes_int_array(U)};
-        } else {
-            ensure_radix_out(a.size());
-            radix_sort_int32(a);
-            // out[n] + count[256]
-            uint64_t mem = bytes_int_array(a.size()) + bytes_int_array(256);
-            return {Mode::RADIX, minv, maxv, U, mem};
         }
+
+        std::vector<uint32_t> localCounts(threads * u, 0);
+        std::vector<std::thread> workers;
+        workers.reserve(threads);
+
+        const size_t base = n / threads;
+        const size_t extra = n % threads;
+        size_t begin = 0;
+
+        for (size_t t = 0; t < threads; t++) {
+            const size_t len = base + (t < extra ? 1 : 0);
+            const size_t left = begin;
+            const size_t right = left + len;
+            begin = right;
+
+            workers.emplace_back([&, t, left, right]() {
+                uint32_t* local = localCounts.data() + t * u;
+                for (size_t i = left; i < right; i++) {
+                    local[(size_t)(a[i] - minv)]++;
+                }
+            });
+        }
+
+        for (auto& th : workers) th.join();
+
+        ensure_counts(u);
+        for (size_t y = 0; y < u; y++) {
+            uint32_t sum = 0;
+            for (size_t t = 0; t < threads; t++) {
+                sum += localCounts[t * u + y];
+            }
+            counts[y] = sum;
+        }
+
+        size_t k = 0;
+        for (size_t y = 0; y < u; y++) {
+            uint32_t c = counts[y];
+            i32 val = (i32)y + minv;
+            while (c--) a[k++] = val;
+        }
+        if (k != a.size()) throw std::runtime_error("Parallel counting did not fill output.");
+
+        return {Mode::COUNTING, minv, maxv, U, bytes_int_array((uint64_t)u) * (uint64_t)threads};
+    }
+
+    Meta sort_in_place(std::vector<i32>& a) {
+        if (a.size() <= 1) {
+            return {Mode::COUNTING, 0, 0, 1, 0};
+        }
+
+        const RangeInfo info = range_of(a);
+        if (counting_ok(info.U, a.size())) {
+            return counting_sort_in_place(a, info.minv, info.maxv, info.U);
+        }
+
+        ensure_radix_out(a.size());
+        radix_sort_int32(a);
+        // out[n] + count[256]
+        uint64_t mem = bytes_int_array(a.size()) + bytes_int_array(256);
+        return {Mode::RADIX, info.minv, info.maxv, info.U, mem};
     }
 
     // Radix LSD base 256, 4 pasadas, signed-safe
@@ -178,8 +276,7 @@ static std::vector<i32> random_full_range(size_t n, uint64_t seed) {
 // ---------------------------
 static inline uint64_t now_ns() {
     return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()
-    ).count();
+        std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 struct Report {
@@ -197,50 +294,33 @@ struct Report {
         double speedup = (double)sortBestNs / (double)dialBestNs;
 
         std::cout << "=== " << title << " ===\n";
-        std::cout << "Data: N=" << N
-                  << " | min=" << meta.minv
-                  << " max=" << meta.maxv
-                  << " U=" << meta.U << "\n\n";
+        std::cout << "Data: N=" << N << " | min=" << meta.minv << " max=" << meta.maxv << " U=" << meta.U
+                  << "\n\n";
 
-        std::cout << std::left
-                  << std::setw(12) << "Algorithm"
-                  << std::setw(9)  << "Mode"
-                  << std::setw(12) << "ms(best)"
-                  << std::setw(12) << "M elems/s"
-                  << std::setw(18) << "speedup(vs sort)"
-                  << std::setw(14) << "mem extra"
-                  << std::setw(12) << "sort ms"
-                  << std::setw(12) << "sort M/s"
+        std::cout << std::left << std::setw(12) << "Algorithm" << std::setw(9) << "Mode" << std::setw(12)
+                  << "ms(best)" << std::setw(12) << "M elems/s" << std::setw(18) << "speedup(vs sort)"
+                  << std::setw(14) << "mem extra" << std::setw(12) << "sort ms" << std::setw(12) << "sort M/s"
                   << "\n";
         std::cout << std::string(95, '-') << "\n";
 
-        std::cout << std::left
-                  << std::setw(12) << "DialSort"
-                  << std::setw(9)  << (meta.mode == Mode::COUNTING ? "COUNTING" : "RADIX")
-                  << std::setw(12) << std::fixed << std::setprecision(3) << dialMs
-                  << std::setw(12) << std::fixed << std::setprecision(3) << dialMeps
-                  << std::setw(18) << std::fixed << std::setprecision(3) << speedup
-                  << std::setw(14) << fmt_bytes(meta.extraBytes)
-                  << std::setw(12) << std::fixed << std::setprecision(3) << sortMs
-                  << std::setw(12) << std::fixed << std::setprecision(3) << sortMeps
-                  << "\n\n";
+        std::cout << std::left << std::setw(12) << "DialSort" << std::setw(9)
+                  << (meta.mode == Mode::COUNTING ? "COUNTING" : "RADIX") << std::setw(12) << std::fixed
+                  << std::setprecision(3) << dialMs << std::setw(12) << std::fixed << std::setprecision(3)
+                  << dialMeps << std::setw(18) << std::fixed << std::setprecision(3) << speedup << std::setw(14)
+                  << fmt_bytes(meta.extraBytes) << std::setw(12) << std::fixed << std::setprecision(3) << sortMs
+                  << std::setw(12) << std::fixed << std::setprecision(3) << sortMeps << "\n\n";
     }
 };
 
 static Meta meta_only(const std::vector<i32>& base) {
-    i32 minv = base[0], maxv = base[0];
-    for (i32 v : base) { if (v < minv) minv = v; if (v > maxv) maxv = v; }
-    uint64_t U = (uint64_t)((int64_t)maxv - (int64_t)minv + 1LL);
-
-    bool countingOk =
-        U > 0 &&
-        U <= (uint64_t)std::numeric_limits<int>::max() &&
-        U <= (uint64_t)MAX_U_FOR_COUNTING &&
-        U <= (uint64_t)U_TO_N_RATIO * (uint64_t)base.size();
-
-    if (countingOk) return {Mode::COUNTING, minv, maxv, U, bytes_int_array(U)};
+    const RangeInfo info = range_of(base);
+    if (counting_ok(info.U, base.size())) {
+        const size_t threads = choose_parallel_counting_threads(base.size(), (size_t)info.U);
+        return {Mode::COUNTING, info.minv, info.maxv, info.U,
+                bytes_int_array(info.U) * (uint64_t)threads};
+    }
     uint64_t mem = bytes_int_array(base.size()) + bytes_int_array(256);
-    return {Mode::RADIX, minv, maxv, U, mem};
+    return {Mode::RADIX, info.minv, info.maxv, info.U, mem};
 }
 
 static uint64_t time_dial(DialSorter& sorter, const std::vector<i32>& base, std::vector<i32>& work) {
@@ -267,10 +347,16 @@ static Report bench_with_report(const std::string& title, const std::vector<i32>
     workDial.reserve(base.size());
     workSort.reserve(base.size());
 
-    std::cout << "Warming... (" << title << ")\n";
+    // std::cout << "Warming... (" << title << ")\n";
 
-    for (int i = 0; i < WARM; i++) { workDial = base; sorter.sort_in_place(workDial); }
-    for (int i = 0; i < WARM; i++) { workSort = base; std::sort(workSort.begin(), workSort.end()); }
+    for (int i = 0; i < WARM; i++) {
+        workDial = base;
+        sorter.sort_in_place(workDial);
+    }
+    for (int i = 0; i < WARM; i++) {
+        workSort = base;
+        std::sort(workSort.begin(), workSort.end());
+    }
 
     Meta meta = meta_only(base);
 
