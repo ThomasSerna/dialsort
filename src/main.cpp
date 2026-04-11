@@ -1,10 +1,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -114,11 +116,117 @@ struct DialSorter {
     std::array<uint32_t, 256> radixCount{};
     std::vector<uint32_t> counts;
 
+    std::mutex countingMutex;
+    std::condition_variable countingTaskCv;
+    std::condition_variable countingDoneCv;
+    std::vector<std::thread> countingWorkers;
+
+    const std::vector<i32>* countingInput = nullptr;
+    i32 countingMinv = 0;
+    size_t countingU = 0;
+    size_t countingBase = 0;
+    size_t countingExtra = 0;
+    uint32_t* countingLocalCounts = nullptr;
+    size_t countingActiveWorkers = 0;
+    size_t countingCompletedWorkers = 0;
+    uint64_t countingGeneration = 0;
+    bool stopCountingWorkers = false;
+
+    ~DialSorter() { shutdown_counting_workers(); }
+
     void ensure_radix_out(size_t n) {
         if (radixOut.size() < n) radixOut.resize(n);
     }
     void ensure_counts(size_t u) {
         if (counts.size() < u) counts.resize(u);
+    }
+
+    void ensure_counting_workers(size_t threads) {
+        while (countingWorkers.size() < threads) {
+            const size_t workerId = countingWorkers.size();
+            countingWorkers.emplace_back([this, workerId]() { counting_worker_loop(workerId); });
+        }
+    }
+
+    void shutdown_counting_workers() {
+        {
+            std::lock_guard<std::mutex> lock(countingMutex);
+            stopCountingWorkers = true;
+        }
+        countingTaskCv.notify_all();
+        for (auto& worker : countingWorkers) {
+            if (worker.joinable()) worker.join();
+        }
+        countingWorkers.clear();
+    }
+
+    void counting_worker_loop(size_t workerId) {
+        uint64_t seenGeneration = 0;
+
+        while (true) {
+            const std::vector<i32>* input = nullptr;
+            i32 minv = 0;
+            size_t u = 0;
+            size_t left = 0;
+            size_t right = 0;
+
+            {
+                std::unique_lock<std::mutex> lock(countingMutex);
+                countingTaskCv.wait(lock, [&]() {
+                    return stopCountingWorkers || countingGeneration != seenGeneration;
+                });
+                if (stopCountingWorkers) return;
+
+                seenGeneration = countingGeneration;
+                if (workerId >= countingActiveWorkers) continue;
+
+                input = countingInput;
+                minv = countingMinv;
+                u = countingU;
+                left = workerId * countingBase + std::min(workerId, countingExtra);
+                right = left + countingBase + (workerId < countingExtra ? 1 : 0);
+            }
+
+            uint32_t* local = countingLocalCounts + workerId * u;
+            for (size_t i = left; i < right; i++) {
+                local[(size_t)((*input)[i] - minv)]++;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(countingMutex);
+                ++countingCompletedWorkers;
+                if (countingCompletedWorkers == countingActiveWorkers) {
+                    countingDoneCv.notify_one();
+                }
+            }
+        }
+    }
+
+    std::vector<uint32_t> run_parallel_counting(std::vector<i32>& a, i32 minv, size_t u, size_t threads) {
+        ensure_counting_workers(threads);
+        std::vector<uint32_t> localCounts(threads * u, 0);
+
+        {
+            std::lock_guard<std::mutex> lock(countingMutex);
+            countingInput = &a;
+            countingMinv = minv;
+            countingU = u;
+            countingBase = a.size() / threads;
+            countingExtra = a.size() % threads;
+            countingLocalCounts = localCounts.data();
+            countingActiveWorkers = threads;
+            countingCompletedWorkers = 0;
+            ++countingGeneration;
+        }
+
+        countingTaskCv.notify_all();
+
+        std::unique_lock<std::mutex> lock(countingMutex);
+        countingDoneCv.wait(lock, [&]() {
+            return countingCompletedWorkers == countingActiveWorkers;
+        });
+
+        return localCounts;
     }
 
     uint64_t counting_extra_bytes(size_t u, size_t n) const {
@@ -148,29 +256,7 @@ struct DialSorter {
             return {Mode::COUNTING, minv, maxv, U, bytes_int_array(U)};
         }
 
-        std::vector<uint32_t> localCounts(threads * u, 0);
-        std::vector<std::thread> workers;
-        workers.reserve(threads);
-
-        const size_t base = n / threads;
-        const size_t extra = n % threads;
-        size_t begin = 0;
-
-        for (size_t t = 0; t < threads; t++) {
-            const size_t len = base + (t < extra ? 1 : 0);
-            const size_t left = begin;
-            const size_t right = left + len;
-            begin = right;
-
-            workers.emplace_back([&, t, left, right]() {
-                uint32_t* local = localCounts.data() + t * u;
-                for (size_t i = left; i < right; i++) {
-                    local[(size_t)(a[i] - minv)]++;
-                }
-            });
-        }
-
-        for (auto& th : workers) th.join();
+        std::vector<uint32_t> localCounts = run_parallel_counting(a, minv, u, threads);
 
         ensure_counts(u);
         for (size_t y = 0; y < u; y++) {
@@ -376,6 +462,15 @@ static Report bench_with_report(const std::string& title, const std::vector<i32>
     return {title, base.size(), meta, bestDial, bestSort};
 }
 
+static void testParallel(size_t n, int q)
+{
+    for (int i = 0; i < q; ++i)
+    {
+        auto small = random_bounded(n, 1000, 123);
+        std::cout << bench_with_report("SmallRange [0..999]", small).dialBestNs/ 1'000'000.0 << std::endl;
+    }
+}
+
 // ---------------------------
 // Main demo
 // ---------------------------
@@ -384,6 +479,8 @@ int main() {
     std::cin.tie(nullptr);
 
     size_t n = 100'000;
+
+    // testParallel(n, 100);
 
     auto small = random_bounded(n, 1000, 123);
     bench_with_report("SmallRange [0..999]", small).print();
