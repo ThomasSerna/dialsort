@@ -25,7 +25,7 @@ static constexpr int   U_TO_N_RATIO       = 8;         // counting si U <= 8*n
 
 // Paralelización counting
 static constexpr size_t MIN_ITEMS_FOR_PARALLEL_COUNTING = 100'000;
-static constexpr size_t MIN_ITEMS_PER_THREAD            = 25'000;
+static constexpr size_t PARALLEL_COUNTING_THREADS       = 8;
 static constexpr uint64_t MAX_PARALLEL_COUNTING_BYTES   = 256ULL * 1024ULL * 1024ULL;
 
 // Benchmark config
@@ -94,18 +94,11 @@ static bool counting_ok(uint64_t U, size_t n) {
 static size_t choose_parallel_counting_threads(size_t n, size_t u) {
     if (n < MIN_ITEMS_FOR_PARALLEL_COUNTING) return 1;
 
-    const unsigned hw = std::thread::hardware_concurrency();
-    size_t threads = hw == 0 ? 2 : (size_t)hw;
-    threads = std::max<size_t>(1, threads);
+    const uint64_t localCountsBytes =
+        (uint64_t)PARALLEL_COUNTING_THREADS * bytes_int_array((uint64_t)u);
+    if (localCountsBytes > MAX_PARALLEL_COUNTING_BYTES) return 1;
 
-    const size_t byWork = std::max<size_t>(1, n / MIN_ITEMS_PER_THREAD);
-    threads = std::min(threads, byWork);
-    if (threads < 2) return 1;
-
-    while (threads > 1 && (uint64_t)threads * bytes_int_array((uint64_t)u) > MAX_PARALLEL_COUNTING_BYTES) {
-        --threads;
-    }
-    return std::max<size_t>(1, threads);
+    return PARALLEL_COUNTING_THREADS;
 }
 
 // ------------------------------------
@@ -478,13 +471,10 @@ int main() {
     std::ios::sync_with_stdio(false);
     std::cin.tie(nullptr);
 
-    size_t n = 100'000;
-
-    // testParallel(n, 100);
+    size_t n = 10'000'000;
 
     auto small = random_bounded(n, 1000, 123);
     bench_with_report("SmallRange [0..999]", small).print();
-
     auto full = random_full_range(n, 456);
     bench_with_report("FullRange int32", full).print();
 
